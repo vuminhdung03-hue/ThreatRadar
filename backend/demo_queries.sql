@@ -4,23 +4,26 @@
 SELECT COUNT(*) as total_threats FROM threats;
 
 -- 2. Count by severity level
-SELECT 
-    CASE 
-        WHEN cvss_score >= 9.0 THEN 'Critical'
-        WHEN cvss_score >= 7.0 THEN 'High'
-        WHEN cvss_score >= 4.0 THEN 'Medium'
-        ELSE 'Low'
-    END as severity,
-    COUNT(*) as count
-FROM threats
-GROUP BY severity
-ORDER BY 
-    CASE 
-        WHEN cvss_score >= 9.0 THEN 1
-        WHEN cvss_score >= 7.0 THEN 2
-        WHEN cvss_score >= 4.0 THEN 3
-        ELSE 4
-    END;
+WITH severity_data AS (
+    SELECT 
+        CASE 
+            WHEN cvss_score >= 9.0 THEN 'Critical'
+            WHEN cvss_score >= 7.0 THEN 'High'
+            WHEN cvss_score >= 4.0 THEN 'Medium'
+            ELSE 'Low'
+        END as severity,
+        CASE 
+            WHEN cvss_score >= 9.0 THEN 1
+            WHEN cvss_score >= 7.0 THEN 2
+            WHEN cvss_score >= 4.0 THEN 3
+            ELSE 4
+        END as severity_order
+    FROM threats
+)
+SELECT severity, COUNT(*) as count
+FROM severity_data
+GROUP BY severity, severity_order
+ORDER BY severity_order;
 
 -- 3. Count by day for last 7 days
 SELECT 

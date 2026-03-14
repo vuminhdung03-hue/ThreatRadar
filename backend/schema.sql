@@ -36,3 +36,15 @@ CREATE TABLE IF NOT EXISTS threat_scores (
 CREATE INDEX IF NOT EXISTS idx_threats_published ON threats(published_date DESC);
 CREATE INDEX IF NOT EXISTS idx_threats_cvss ON threats(cvss_score DESC);
 CREATE INDEX IF NOT EXISTS idx_threat_scores_env ON threat_scores(environment_id, relevance_score DESC);
+
+CREATE TABLE IF NOT EXISTS threats (
+    cve_id VARCHAR(20) PRIMARY KEY,
+    cvss_score FLOAT,
+    cvss_vector VARCHAR(100),
+    epss_score FLOAT,  -- ALREADY THERE from your proposal!
+    description TEXT,
+    published_date TIMESTAMP,
+    is_kev BOOLEAN DEFAULT FALSE,  -- ALREADY THERE!
+    affected_products TEXT[],
+    created_at TIMESTAMP DEFAULT NOW()
+);
