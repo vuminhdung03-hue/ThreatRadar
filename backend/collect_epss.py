@@ -2,11 +2,12 @@ import requests
 import time
 from database import get_connection
 
+# FIRST.org EPSS API endpoint - found this in their documentation
 EPSS_API_URL = "https://api.first.org/data/v1/epss"
 
 def fetch_epss_score(cve_id):
     """
-    Fetch EPSS score for a single CVE
+    Fetch EPSS score for a single CVE from FIRST.org
     
     Args:
         cve_id: CVE identifier (e.g., 'CVE-2026-27941')
@@ -16,24 +17,28 @@ def fetch_epss_score(cve_id):
     """
     try:
         params = {"cve": cve_id}
+        # Using 10 sec timeout - API can be slow sometimes
         response = requests.get(EPSS_API_URL, params=params, timeout=10)
         response.raise_for_status()
         
         data = response.json()
         
+        # Check if we got valid data back
         if data.get('status') == 'OK' and data.get('data'):
             epss_value = float(data['data'][0]['epss'])
-            # Convert 0.0-1.0 to 0-100 scale
+            # API returns 0.0-1.0 scale, I'm converting to percentage (0-100)
+            # Makes it easier to understand: "85%" vs "0.85"
             return epss_value * 100
         
         return None
         
     except Exception as e:
-        print(f"  ✗ Error fetching EPSS for {cve_id}: {e}")
+        # Some CVEs are too new to have EPSS scores yet
+        print(f"  Couldn't fetch EPSS for {cve_id}: {e}")
         return None
 
 def update_threat_epss(conn, cve_id, epss_score):
-    """Update a threat with its EPSS score"""
+    """Update a threat with its EPSS score in database"""
     cursor = conn.cursor()
     
     query = "UPDATE threats SET epss_score = %s WHERE cve_id = %s;"
@@ -43,7 +48,7 @@ def update_threat_epss(conn, cve_id, epss_score):
     cursor.close()
 
 def get_all_cve_ids(conn):
-    """Get list of all CVE IDs in database"""
+    """Get list of all CVE IDs currently in database"""
     cursor = conn.cursor()
     cursor.execute("SELECT cve_id FROM threats;")
     cve_ids = [row[0] for row in cursor.fetchall()]
@@ -61,18 +66,18 @@ def main():
         conn = get_connection()
         print("✓ Connected to database")
     except Exception as e:
-        print(f"✗ Database connection failed: {e}")
+        print(f"Database connection failed: {e}")
         return
     
-    # Get all CVE IDs
+    # Get all CVE IDs from threats table
     cve_ids = get_all_cve_ids(conn)
     print(f"Found {len(cve_ids)} CVEs to process")
     
     # Fetch EPSS for each CVE
-    updated = 0
-    skipped = 0
+    success_count = 0
+    failed_count = 0
     
-    print("\nFetching EPSS scores...")
+    print("\nFetching EPSS scores from FIRST.org API...")
     for i, cve_id in enumerate(cve_ids, 1):
         print(f"[{i}/{len(cve_ids)}] {cve_id}...", end=" ")
         
@@ -81,18 +86,20 @@ def main():
         if epss_score is not None:
             update_threat_epss(conn, cve_id, epss_score)
             print(f"✓ EPSS: {epss_score:.2f}%")
-            updated += 1
+            success_count += 1
         else:
             print("✗ Not found")
-            skipped += 1
+            failed_count += 1
         
-        # Rate limiting - be nice to the API
-        time.sleep(1)  # 1 second between requests
+        # Rate limiting - wait 1 second between requests
+        # Tried 0.5 seconds first but seemed too aggressive
+        # 1 second works fine and is respectful to their free API
+        time.sleep(1)
     
     print("\n" + "=" * 60)
     print(f"EPSS collection complete!")
-    print(f"  Updated: {updated} CVEs")
-    print(f"  Skipped: {skipped} CVEs")
+    print(f"  Successfully updated: {success_count} CVEs")
+    print(f"  Failed/Not found: {failed_count} CVEs")
     print("=" * 60)
     
     conn.close()
