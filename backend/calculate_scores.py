@@ -91,11 +91,11 @@ def calculate_scores_for_environment(environment_id):
         
         # Get all threats
         cur.execute("""
-            SELECT 
+            SELECT
                 cve_id,
                 cvss_score,
                 epss_score,
-                is_kev,
+                (in_cisa_kev OR in_vulncheck_kev) AS is_kev,
                 published_date
             FROM threats
             WHERE cvss_score IS NOT NULL
@@ -122,12 +122,12 @@ def calculate_scores_for_environment(environment_id):
                     INSERT INTO threat_scores (
                         threat_id,
                         environment_id,
-                        relevance_score
+                        composite_score
                     ) VALUES (%s, %s, %s)
-                    ON CONFLICT (threat_id, environment_id) 
+                    ON CONFLICT (threat_id, environment_id)
                     DO UPDATE SET
-                        relevance_score = EXCLUDED.relevance_score,
-                        computed_at = CURRENT_TIMESTAMP
+                        composite_score = EXCLUDED.composite_score,
+                        calculated_at = CURRENT_TIMESTAMP
                 """, (
                     cve_id,
                     environment_id,
@@ -167,19 +167,18 @@ def show_top_threats(environment_id, limit=10):
         print(f"TOP {limit} THREATS FOR: {env_name}")
         print(f"{'=' * 80}")
         
-        # Query with correct column name: relevance_score
         cur.execute("""
-            SELECT 
+            SELECT
                 t.cve_id,
                 t.cvss_score,
                 t.epss_score,
-                t.is_kev,
-                ts.relevance_score,
+                (t.in_cisa_kev OR t.in_vulncheck_kev) AS is_kev,
+                ts.composite_score,
                 t.description
             FROM threat_scores ts
             JOIN threats t ON ts.threat_id = t.cve_id
             WHERE ts.environment_id = %s
-            ORDER BY ts.relevance_score DESC
+            ORDER BY ts.composite_score DESC
             LIMIT %s
         """, (environment_id, limit))
         

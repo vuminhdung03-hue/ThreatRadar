@@ -93,7 +93,7 @@ def update_kev_flags(kev_cves):
         
         # First, reset all KEV flags to FALSE
         # (in case a CVE was removed from the KEV list)
-        cur.execute("UPDATE threats SET is_kev = FALSE")
+        cur.execute("UPDATE threats SET in_cisa_kev = FALSE")
         
         # Get all CVEs currently in our database
         cur.execute("SELECT cve_id FROM threats")
@@ -108,20 +108,20 @@ def update_kev_flags(kev_cves):
         if matched_cves:
             print(f"✓ Found {len(matched_cves)} CVEs that are on the KEV list!")
             
-            # Update is_kev flag for matched CVEs
+            # Update in_cisa_kev flag for matched CVEs
             # Using ANY for efficient bulk update
             cur.execute(
-                "UPDATE threats SET is_kev = TRUE WHERE cve_id = ANY(%s)",
+                "UPDATE threats SET in_cisa_kev = TRUE WHERE cve_id = ANY(%s)",
                 (list(matched_cves),)
             )
-            
+
             # Show which CVEs were flagged
             print("\nCVEs flagged as actively exploited:")
             cur.execute(
                 """
-                SELECT cve_id, cvss_score, description 
-                FROM threats 
-                WHERE is_kev = TRUE 
+                SELECT cve_id, cvss_score, description
+                FROM threats
+                WHERE in_cisa_kev = TRUE
                 ORDER BY cvss_score DESC
                 """
             )
@@ -137,7 +137,7 @@ def update_kev_flags(kev_cves):
         conn.commit()
         
         # Get final count
-        cur.execute("SELECT COUNT(*) FROM threats WHERE is_kev = TRUE")
+        cur.execute("SELECT COUNT(*) FROM threats WHERE in_cisa_kev = TRUE")
         kev_count = cur.fetchone()[0]
         
         cur.close()

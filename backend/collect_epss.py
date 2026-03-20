@@ -25,25 +25,26 @@ def fetch_epss_score(cve_id):
         
         # Check if we got valid data back
         if data.get('status') == 'OK' and data.get('data'):
-            epss_value = float(data['data'][0]['epss'])
-            # API returns 0.0-1.0 scale, I'm converting to percentage (0-100)
-            # Makes it easier to understand: "85%" vs "0.85"
-            return epss_value * 100
-        
-        return None
+            entry = data['data'][0]
+            epss_value = float(entry['epss'])
+            percentile_value = float(entry.get('percentile', 0))
+            # API returns 0.0-1.0 scale; store as-is
+            return epss_value, percentile_value
+
+        return None, None
         
     except Exception as e:
         # Some CVEs are too new to have EPSS scores yet
         print(f"  Couldn't fetch EPSS for {cve_id}: {e}")
         return None
 
-def update_threat_epss(conn, cve_id, epss_score):
-    """Update a threat with its EPSS score in database"""
+def update_threat_epss(conn, cve_id, epss_score, epss_percentile):
+    """Update a threat with its EPSS score and percentile in database"""
     cursor = conn.cursor()
-    
-    query = "UPDATE threats SET epss_score = %s WHERE cve_id = %s;"
-    cursor.execute(query, (epss_score, cve_id))
-    
+
+    query = "UPDATE threats SET epss_score = %s, epss_percentile = %s WHERE cve_id = %s;"
+    cursor.execute(query, (epss_score, epss_percentile, cve_id))
+
     conn.commit()
     cursor.close()
 
@@ -81,11 +82,11 @@ def main():
     for i, cve_id in enumerate(cve_ids, 1):
         print(f"[{i}/{len(cve_ids)}] {cve_id}...", end=" ")
         
-        epss_score = fetch_epss_score(cve_id)
-        
+        epss_score, epss_percentile = fetch_epss_score(cve_id)
+
         if epss_score is not None:
-            update_threat_epss(conn, cve_id, epss_score)
-            print(f"✓ EPSS: {epss_score:.2f}%")
+            update_threat_epss(conn, cve_id, epss_score, epss_percentile)
+            print(f"✓ EPSS: {epss_score:.4f} (p{epss_percentile:.0%})")
             success_count += 1
         else:
             print("✗ Not found")
