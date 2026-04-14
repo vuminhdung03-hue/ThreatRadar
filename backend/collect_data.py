@@ -193,13 +193,14 @@ def store_cves_in_database(cves):
                 # Insert CVE (ignore if already exists)
                 cur.execute("""
                     INSERT INTO threats (
-                        cve_id, 
-                        description, 
+                        cve_id,
+                        description,
                         cvss_score,
                         cvss_vector,
                         published_date,
-                        affected_products
-                    ) VALUES (%s, %s, %s, %s, %s, %s)
+                        affected_products,
+                        technologies
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (cve_id) DO NOTHING
                 """, (
                     cve['cve_id'],
@@ -207,7 +208,8 @@ def store_cves_in_database(cves):
                     cve['cvss_score'],
                     cve['cvss_vector'],
                     cve['published_date'],
-                    cve['affected_products'][:10]  # Limit to 10 products
+                    cve['affected_products'][:10],  # Limit to 10 products
+                    cve['affected_products'][:10]   # technologies = same vendor:product list
                 ))
                 
                 if cur.rowcount > 0:

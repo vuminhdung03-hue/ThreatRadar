@@ -9,21 +9,26 @@ Course: CSC498 - ThreatRadar Capstone
 import psycopg2
 from datetime import datetime
 import os
+import sys
 from dotenv import load_dotenv
 import json
+
+# Fix Unicode output on Windows terminals
+if sys.platform == 'win32':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 load_dotenv()
 
 def calculate_threat_score(threat):
     """
     Calculate composite threat score
-    
+
     Formula:
     - CVSS (40%): Severity
-    - EPSS (30%): Exploit probability  
+    - EPSS (30%): Exploit probability
     - Recency (10%): How new
-    - Tech baseline (20%): Fixed baseline for now
-    
+    - Tech match (20%): How many env technologies the CVE affects
+
     Multipliers:
     - KEV: 1.5x (actively exploited!)
     """
@@ -31,13 +36,14 @@ def calculate_threat_score(threat):
     epss = threat.get('epss_score', 0) or 0
     is_kev = threat.get('is_kev', False)
     published_date = threat.get('published_date')
-    
+    tech_match_count = threat.get('tech_match_count', 0) or 0
+
     # CVSS Component (40%)
     cvss_contribution = (cvss / 10.0) * 0.4
-    
+
     # EPSS Component (30%)
     epss_contribution = (epss / 100.0) * 0.3
-    
+
     # Recency Component (10%)
     recency_score = 0
     if published_date:
@@ -46,31 +52,40 @@ def calculate_threat_score(threat):
                 pub_date = datetime.fromisoformat(published_date.replace('Z', '+00:00'))
             else:
                 pub_date = published_date
-            
+
             days_old = (datetime.now(pub_date.tzinfo) - pub_date).days
             recency_score = max(0, 1 - (days_old / 90))
         except:
             recency_score = 0
-    
+
     recency_contribution = recency_score * 0.1
-    
-    # Tech baseline (20%) - simplified for Checkpoint 2
-    tech_contribution = 0.1  # 50% baseline
-    
+
+    # Tech match component (20%): score rises with each matching technology
+    # 1 match = 50%, 2 matches = 75%, 3+ matches = 100% of the 20% weight
+    if tech_match_count >= 3:
+        tech_score = 1.0
+    elif tech_match_count == 2:
+        tech_score = 0.75
+    elif tech_match_count == 1:
+        tech_score = 0.5
+    else:
+        tech_score = 0.0
+    tech_contribution = tech_score * 0.2
+
     # Calculate base score
     base_score = (
-        cvss_contribution + 
-        epss_contribution + 
-        tech_contribution + 
+        cvss_contribution +
+        epss_contribution +
+        tech_contribution +
         recency_contribution
     )
-    
+
     # Apply KEV multiplier
     multiplier = 1.5 if is_kev else 1.0
-    
+
     # Final score (capped at 1.0)
     final_score = min(base_score * multiplier, 1.0)
-    
+
     return final_score
 
 def calculate_scores_for_environment(environment_id):
@@ -80,64 +95,77 @@ def calculate_scores_for_environment(environment_id):
         conn = psycopg2.connect(os.getenv('DATABASE_URL'))
         cur = conn.cursor()
         
-        # Get environment name
-        cur.execute("SELECT name FROM environment_profiles WHERE id = %s", (environment_id,))
+        # Get environment name and technologies
+        cur.execute("SELECT name, technologies FROM environment_profiles WHERE id = %s", (environment_id,))
         result = cur.fetchone()
         if not result:
             return 0
-        
-        env_name = result[0]
-        print(f"\nCalculating scores for: {env_name}")
-        
-        # Get all threats
+
+        env_name, env_technologies = result
+        env_tech_set = set(env_technologies or [])
+        print(f"\nCalculating scores for: {env_name} ({len(env_tech_set)} technologies)")
+
+        # Get all threats including technologies
         cur.execute("""
             SELECT
                 cve_id,
                 cvss_score,
                 epss_score,
                 (in_cisa_kev OR in_vulncheck_kev) AS is_kev,
-                published_date
+                published_date,
+                technologies
             FROM threats
-            WHERE cvss_score IS NOT NULL
         """)
-        
+
         threats = cur.fetchall()
         print(f"Processing {len(threats)} CVEs...")
-        
+
         scores_calculated = 0
-        
-        for cve_id, cvss, epss, kev, pub_date in threats:
+
+        for cve_id, cvss, epss, kev, pub_date, technologies in threats:
+            threat_techs = list(technologies or [])
+            # Use prefix matching: env tech "vendor:product" matches CPE "vendor:product_version"
+            tech_match_count = sum(
+                1 for env_tech in env_tech_set
+                if any(t == env_tech or t.startswith(env_tech + '_') or t.startswith(env_tech + ':')
+                       for t in threat_techs)
+            )
+
             threat = {
                 'cvss_score': cvss,
                 'epss_score': epss,
                 'is_kev': kev,
-                'published_date': pub_date
+                'published_date': pub_date,
+                'tech_match_count': tech_match_count
             }
-            
+
             final_score = calculate_threat_score(threat)
-            
+
             try:
-                # Insert with correct column name: relevance_score
                 cur.execute("""
                     INSERT INTO threat_scores (
                         threat_id,
                         environment_id,
-                        composite_score
-                    ) VALUES (%s, %s, %s)
+                        composite_score,
+                        tech_match_count
+                    ) VALUES (%s, %s, %s, %s)
                     ON CONFLICT (threat_id, environment_id)
                     DO UPDATE SET
                         composite_score = EXCLUDED.composite_score,
-                        calculated_at = CURRENT_TIMESTAMP
+                        tech_match_count = EXCLUDED.tech_match_count,
+                        computed_at = CURRENT_TIMESTAMP
                 """, (
                     cve_id,
                     environment_id,
-                    final_score
+                    final_score,
+                    tech_match_count
                 ))
                 
                 scores_calculated += 1
                 
             except Exception as e:
                 print(f"✗ Error storing score for {cve_id}: {e}")
+                conn.rollback()
                 continue
         
         conn.commit()
@@ -189,9 +217,9 @@ def show_top_threats(environment_id, limit=10):
         
         for i, (cve_id, cvss, epss, kev, score, desc) in enumerate(threats, 1):
             kev_flag = "✓" if kev else ""
-            epss_val = epss if epss else 0
-            
-            print(f"{i:<5} {cve_id:<18} {score:>6.1%} {cvss:<7.1f} {epss_val:>6.1f}% {kev_flag:<5}")
+            cvss_val = cvss if cvss is not None else 0.0
+            epss_val = epss if epss is not None else 0.0
+            print(f"{i:<5} {cve_id:<18} {score:>6.1%} {cvss_val:<7.1f} {epss_val:>6.1f}% {kev_flag:<5}")
             
             # Show description for top 3
             if i <= 3:

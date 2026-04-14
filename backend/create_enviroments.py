@@ -67,7 +67,7 @@ def create_environment_profiles():
     Returns:
         int: Number of profiles created
     """
-    print("=" * 60)
+    
     print("ThreatRadar - Environment Profile Setup")
     print("=" * 60)
     
