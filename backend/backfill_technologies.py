@@ -1,7 +1,4 @@
-"""
-Backfill technologies column from affected_products for existing threats.
-Run once to fix the 730 existing rows.
-"""
+
 
 import psycopg2
 import os

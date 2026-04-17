@@ -1,296 +1,261 @@
 """
-Threat Scoring Algorithm - Final Working Version
+Threat Scoring Algorithm
+Calculates composite scores for all threats × all environments.
 
 Author: Dung Vu
-Date: March 2026
+Date: March 2026 (updated April 2026)
 Course: CSC498 - ThreatRadar Capstone
+
+Usage:
+  python calculate_scores.py
 """
+
+import json
+import os
+import sys
 
 import psycopg2
 from datetime import datetime
-import os
-import sys
 from dotenv import load_dotenv
-import json
+
+load_dotenv()
+
+# Allow importing CPEMatcher from app/ when run from backend/
+sys.path.insert(0, os.path.dirname(__file__))
+from app.services.cpe_matcher import CPEMatcher
 
 # Fix Unicode output on Windows terminals
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
-load_dotenv()
 
-def calculate_threat_score(threat):
+def _psycopg2_url(raw_url: str) -> str:
+    return raw_url.replace('postgresql+asyncpg://', 'postgresql://', 1)
+
+
+def _priority(score: float) -> str:
+    if score >= 0.75:
+        return 'CRITICAL'
+    if score >= 0.50:
+        return 'HIGH'
+    if score >= 0.25:
+        return 'MEDIUM'
+    return 'LOW'
+
+
+def calculate_threat_score(
+    cvss: float,
+    epss: float,
+    is_kev: bool,
+    published_date,
+    tech_match_count: int,
+    tech_match_score: float,
+) -> tuple[float, dict]:
     """
-    Calculate composite threat score
-
-    Formula:
-    - CVSS (40%): Severity
-    - EPSS (30%): Exploit probability
-    - Recency (10%): How new
-    - Tech match (20%): How many env technologies the CVE affects
-
-    Multipliers:
-    - KEV: 1.5x (actively exploited!)
+    Composite score formula:
+      CVSS     40%  — severity
+      EPSS     30%  — exploit probability (stored as 0–1, not 0–100)
+      Tech     20%  — environment relevance (continuous CPE match score)
+      Recency  10%  — how new the CVE is (decays to 0 after 90 days)
+      KEV      1.5× multiplier if actively exploited
     """
-    cvss = threat.get('cvss_score', 0) or 0
-    epss = threat.get('epss_score', 0) or 0
-    is_kev = threat.get('is_kev', False)
-    published_date = threat.get('published_date')
-    tech_match_count = threat.get('tech_match_count', 0) or 0
-
-    # CVSS Component (40%)
     cvss_contribution = (cvss / 10.0) * 0.4
+    epss_contribution = epss * 0.3          # EPSS is 0–1, no /100 needed
 
-    # EPSS Component (30%)
-    epss_contribution = (epss / 100.0) * 0.3
-
-    # Recency Component (10%)
-    recency_score = 0
+    recency_score = 0.0
     if published_date:
         try:
             if isinstance(published_date, str):
-                pub_date = datetime.fromisoformat(published_date.replace('Z', '+00:00'))
+                pub_dt = datetime.fromisoformat(published_date.replace('Z', '+00:00'))
             else:
-                pub_date = published_date
-
-            days_old = (datetime.now(pub_date.tzinfo) - pub_date).days
-            recency_score = max(0, 1 - (days_old / 90))
-        except:
-            recency_score = 0
-
+                pub_dt = published_date
+            days_old = (datetime.now(pub_dt.tzinfo) - pub_dt).days
+            recency_score = max(0.0, 1.0 - (days_old / 90))
+        except Exception:
+            pass
     recency_contribution = recency_score * 0.1
 
-    # Tech match component (20%): score rises with each matching technology
-    # 1 match = 50%, 2 matches = 75%, 3+ matches = 100% of the 20% weight
-    if tech_match_count >= 3:
-        tech_score = 1.0
-    elif tech_match_count == 2:
-        tech_score = 0.75
-    elif tech_match_count == 1:
-        tech_score = 0.5
-    else:
-        tech_score = 0.0
-    tech_contribution = tech_score * 0.2
+    tech_contribution = min(tech_match_score, 1.0) * 0.2
 
-    # Calculate base score
-    base_score = (
-        cvss_contribution +
-        epss_contribution +
-        tech_contribution +
-        recency_contribution
-    )
-
-    # Apply KEV multiplier
+    base_score = cvss_contribution + epss_contribution + tech_contribution + recency_contribution
     multiplier = 1.5 if is_kev else 1.0
-
-    # Final score (capped at 1.0)
     final_score = min(base_score * multiplier, 1.0)
 
-    return final_score
+    breakdown = {
+        "cvss_contribution": round(cvss_contribution, 4),
+        "epss_contribution": round(epss_contribution, 4),
+        "tech_contribution": round(tech_contribution, 4),
+        "recency_contribution": round(recency_contribution, 4),
+        "kev_multiplier": multiplier,
+        "base_score": round(base_score, 4),
+        "final_score": round(final_score, 4),
+        "tech_match_count": tech_match_count,
+        "tech_match_score": round(tech_match_score, 4),
+    }
+    return final_score, breakdown
 
-def calculate_scores_for_environment(environment_id):
-    """Calculate scores for all CVEs for one environment"""
-    
-    try:
-        conn = psycopg2.connect(os.getenv('DATABASE_URL'))
-        cur = conn.cursor()
-        
-        # Get environment name and technologies
-        cur.execute("SELECT name, technologies FROM environment_profiles WHERE id = %s", (environment_id,))
-        result = cur.fetchone()
-        if not result:
-            return 0
 
-        env_name, env_technologies = result
-        env_tech_set = set(env_technologies or [])
-        print(f"\nCalculating scores for: {env_name} ({len(env_tech_set)} technologies)")
+def calculate_scores_for_environment(conn, environment_id: int) -> int:
+    """Calculate and upsert scores for all threats in one environment."""
+    cur = conn.cursor()
 
-        # Get all threats including technologies
-        cur.execute("""
-            SELECT
-                cve_id,
-                cvss_score,
-                epss_score,
-                (in_cisa_kev OR in_vulncheck_kev) AS is_kev,
-                published_date,
-                technologies
-            FROM threats
-        """)
-
-        threats = cur.fetchall()
-        print(f"Processing {len(threats)} CVEs...")
-
-        scores_calculated = 0
-
-        for cve_id, cvss, epss, kev, pub_date, technologies in threats:
-            threat_techs = list(technologies or [])
-            # Use prefix matching: env tech "vendor:product" matches CPE "vendor:product_version"
-            tech_match_count = sum(
-                1 for env_tech in env_tech_set
-                if any(t == env_tech or t.startswith(env_tech + '_') or t.startswith(env_tech + ':')
-                       for t in threat_techs)
-            )
-
-            threat = {
-                'cvss_score': cvss,
-                'epss_score': epss,
-                'is_kev': kev,
-                'published_date': pub_date,
-                'tech_match_count': tech_match_count
-            }
-
-            final_score = calculate_threat_score(threat)
-
-            try:
-                cur.execute("""
-                    INSERT INTO threat_scores (
-                        threat_id,
-                        environment_id,
-                        composite_score,
-                        tech_match_count
-                    ) VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (threat_id, environment_id)
-                    DO UPDATE SET
-                        composite_score = EXCLUDED.composite_score,
-                        tech_match_count = EXCLUDED.tech_match_count,
-                        computed_at = CURRENT_TIMESTAMP
-                """, (
-                    cve_id,
-                    environment_id,
-                    final_score,
-                    tech_match_count
-                ))
-                
-                scores_calculated += 1
-                
-            except Exception as e:
-                print(f"✗ Error storing score for {cve_id}: {e}")
-                conn.rollback()
-                continue
-        
-        conn.commit()
+    cur.execute(
+        "SELECT name, technologies FROM environment_profiles WHERE id = %s",
+        (environment_id,),
+    )
+    row = cur.fetchone()
+    if not row:
         cur.close()
-        conn.close()
-        
-        return scores_calculated
-        
-    except Exception as e:
-        print(f"✗ Database error: {e}")
-        import traceback
-        traceback.print_exc()
         return 0
 
-def show_top_threats(environment_id, limit=10):
-    """Display top threats for an environment"""
-    
-    try:
-        conn = psycopg2.connect(os.getenv('DATABASE_URL'))
-        cur = conn.cursor()
-        
-        # Get environment name
-        cur.execute("SELECT name FROM environment_profiles WHERE id = %s", (environment_id,))
-        env_name = cur.fetchone()[0]
-        
-        print(f"\n{'=' * 80}")
-        print(f"TOP {limit} THREATS FOR: {env_name}")
-        print(f"{'=' * 80}")
-        
-        cur.execute("""
-            SELECT
-                t.cve_id,
-                t.cvss_score,
-                t.epss_score,
-                (t.in_cisa_kev OR t.in_vulncheck_kev) AS is_kev,
-                ts.composite_score,
-                t.description
-            FROM threat_scores ts
-            JOIN threats t ON ts.threat_id = t.cve_id
-            WHERE ts.environment_id = %s
-            ORDER BY ts.composite_score DESC
-            LIMIT %s
-        """, (environment_id, limit))
-        
-        threats = cur.fetchall()
-        
-        print(f"\n{'Rank':<5} {'CVE ID':<18} {'Score':<8} {'CVSS':<7} {'EPSS':<8} {'KEV':<5}")
-        print("-" * 80)
-        
-        for i, (cve_id, cvss, epss, kev, score, desc) in enumerate(threats, 1):
-            kev_flag = "✓" if kev else ""
-            cvss_val = cvss if cvss is not None else 0.0
-            epss_val = epss if epss is not None else 0.0
-            print(f"{i:<5} {cve_id:<18} {score:>6.1%} {cvss_val:<7.1f} {epss_val:>6.1f}% {kev_flag:<5}")
-            
-            # Show description for top 3
-            if i <= 3:
-                short_desc = (desc[:70] + '...') if desc and len(desc) > 70 else (desc or 'No description')
-                print(f"      └─ {short_desc}")
-        
-        print("\nLegend:")
-        print("  Score = Threat relevance score (0-100%)")
-        print("  CVSS  = Severity (0-10)")
-        print("  EPSS  = Exploit probability (0-100%)")
-        print("  KEV   = ✓ if actively exploited")
-        
-        cur.close()
-        conn.close()
-        
-    except Exception as e:
-        print(f"✗ Error: {e}")
-        import traceback
-        traceback.print_exc()
+    env_name, env_technologies = row
+    env_techs = list(env_technologies or [])
+    print(f"\n  [{env_name}] — {len(env_techs)} env technologies")
 
-def main():
-    """Main scoring function"""
-    
-    print("=" * 80)
-    print("ThreatRadar - Threat Scoring Algorithm")
-    print("=" * 80)
-    
+    cur.execute("""
+        SELECT cve_id, cvss_score, epss_score,
+               (in_cisa_kev OR in_vulncheck_kev) AS is_kev,
+               published_date, cpe_data, technologies
+        FROM threats
+    """)
+    threats = cur.fetchall()
+    total = len(threats)
+    print(f"    Scoring {total} threats...")
+
+    scored = skipped = errors = 0
+
+    for i, (cve_id, cvss, epss, is_kev, pub_date, cpe_data, techs) in enumerate(threats, 1):
+        if cvss is None:
+            skipped += 1
+            continue
+
+        # Tech matching — prefer cpe_data JSONB, fall back to technologies TEXT[]
+        if cpe_data:
+            matches, match_score = CPEMatcher.count_matches(env_techs, cpe_data)
+        else:
+            synthetic = [
+                {"vendor": p.split(':')[0], "product": p.split(':')[1]}
+                for p in (techs or []) if ':' in p
+            ]
+            matches, match_score = CPEMatcher.count_matches(env_techs, synthetic)
+
+        final_score, breakdown = calculate_threat_score(
+            cvss or 0,
+            epss or 0,
+            bool(is_kev),
+            pub_date,
+            matches,
+            match_score,
+        )
+        priority = _priority(final_score)
+
+        try:
+            cur.execute("""
+                INSERT INTO threat_scores
+                    (threat_id, environment_id, composite_score, priority_level,
+                     tech_match_count, score_breakdown, calculated_at)
+                VALUES (%s, %s, %s, %s, %s, %s::jsonb, NOW())
+                ON CONFLICT (threat_id, environment_id) DO UPDATE SET
+                    composite_score  = EXCLUDED.composite_score,
+                    priority_level   = EXCLUDED.priority_level,
+                    tech_match_count = EXCLUDED.tech_match_count,
+                    score_breakdown  = EXCLUDED.score_breakdown,
+                    calculated_at    = NOW()
+            """, (cve_id, environment_id, final_score, priority,
+                  matches, json.dumps(breakdown)))
+            scored += 1
+        except Exception as e:
+            print(f"    ✗ Error scoring {cve_id}: {e}")
+            conn.rollback()
+            errors += 1
+            continue
+
+        if i % 1000 == 0:
+            conn.commit()
+            print(f"    {i}/{total}  scored={scored}  skipped={skipped}  errors={errors}")
+
+    conn.commit()
+    cur.close()
+    print(f"  ✓ {scored} scores upserted  ({skipped} no-CVSS skipped, {errors} errors)")
+    return scored
+
+
+def show_top_threats(conn, environment_id: int, limit: int = 5) -> None:
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM environment_profiles WHERE id = %s", (environment_id,))
+    env_name = cur.fetchone()[0]
+
+    print(f"\n  Top {limit} for {env_name}:")
+    print(f"  {'CVE ID':<20} {'Score':>6}  {'CVSS':>5}  {'EPSS':>6}  {'Matches':>7}  Priority")
+    print(f"  {'-'*20} {'-'*6}  {'-'*5}  {'-'*6}  {'-'*7}  --------")
+
+    cur.execute("""
+        SELECT t.cve_id, ts.composite_score, t.cvss_score,
+               t.epss_score, ts.tech_match_count, ts.priority_level
+        FROM threat_scores ts
+        JOIN threats t ON ts.threat_id = t.cve_id
+        WHERE ts.environment_id = %s
+        ORDER BY ts.composite_score DESC
+        LIMIT %s
+    """, (environment_id, limit))
+
+    for cve_id, score, cvss, epss, matches, priority in cur.fetchall():
+        epss_pct = f"{(epss or 0)*100:.1f}%"
+        print(f"  {cve_id:<20} {score:>6.1%}  {(cvss or 0):>5.1f}  {epss_pct:>6}  {matches:>7}  {priority}")
+    cur.close()
+
+
+def main() -> None:
+    print("=" * 70)
+    print("ThreatRadar — Threat Scoring Algorithm")
+    print("=" * 70)
+
+    db_url = _psycopg2_url(os.getenv('DATABASE_URL', ''))
     try:
-        # Get all environments
-        conn = psycopg2.connect(os.getenv('DATABASE_URL'))
-        cur = conn.cursor()
-        
-        cur.execute("SELECT id, name FROM environment_profiles ORDER BY name")
-        environments = cur.fetchall()
-        
-        if not environments:
-            print("\n✗ No environment profiles found!")
-            print("  Run create_environments.py first")
-            return
-        
-        print(f"\nFound {len(environments)} environment profiles:")
-        for env_id, env_name in environments:
-            print(f"  • {env_name}")
-        
-        cur.close()
-        conn.close()
-        
-        # Calculate scores for each environment
-        total_scores = 0
-        
-        for env_id, env_name in environments:
-            scores = calculate_scores_for_environment(env_id)
-            total_scores += scores
-            print(f"✓ Calculated {scores} threat scores")
-        
-        print("\n" + "=" * 80)
-        print(f"Scoring complete!")
-        print(f"Total scores calculated: {total_scores}")
-        print(f"(730 CVEs × {len(environments)} environments = {730 * len(environments)} expected)")
-        print("=" * 80)
-        
-        # Show top threats for each environment
-        for env_id, env_name in environments:
-            show_top_threats(env_id, limit=5)
-        
-      
-        
+        conn = psycopg2.connect(db_url)
     except Exception as e:
-        print(f"✗ Error: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"✗ Database connection failed: {e}")
+        return
+
+    cur = conn.cursor()
+    cur.execute("SELECT id, name FROM environment_profiles ORDER BY id")
+    environments = cur.fetchall()
+
+    cur.execute("SELECT COUNT(*) FROM threats")
+    threat_count = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM threat_scores")
+    scores_before = cur.fetchone()[0]
+    cur.close()
+
+    print(f"\nThreats in DB         : {threat_count}")
+    print(f"threat_scores before  : {scores_before}")
+    print(f"Environments          : {len(environments)}")
+    print(f"Expected scores       : {threat_count} × {len(environments)} = {threat_count * len(environments)}")
+
+    total_scored = 0
+    for env_id, _ in environments:
+        scored = calculate_scores_for_environment(conn, env_id)
+        total_scored += scored
+
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM threat_scores")
+    scores_after = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM threat_scores WHERE tech_match_count > 0")
+    matched = cur.fetchone()[0]
+    cur.close()
+
+    print("\n" + "=" * 70)
+    print("Scoring complete!")
+    print(f"  threat_scores before : {scores_before}")
+    print(f"  threat_scores after  : {scores_after}")
+    print(f"  tech_match_count > 0 : {matched} / {scores_after}")
+    print("=" * 70)
+
+    for env_id, _ in environments:
+        show_top_threats(conn, env_id, limit=5)
+
+    conn.close()
+
 
 if __name__ == "__main__":
     main()
